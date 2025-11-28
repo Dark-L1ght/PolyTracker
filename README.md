@@ -29,7 +29,7 @@ PolyTracker is a Python-based Telegram bot that tracks Polymarket traders in rea
 ## 📥 Installation
 1.  Clone the repository:
 ```
-git clone https://github.com/Dark-L1ght/polytracker-bot.git
+git clone https://github.com/Dark-L1ght/PolyTracker.git
 cd polytracker-bot
 ```
 
