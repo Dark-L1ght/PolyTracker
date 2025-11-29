@@ -3,9 +3,10 @@ import json
 import asyncio
 import os
 import sys
+import sqlite3
 from dotenv import load_dotenv
-import requests
-from telegram import Update, BotCommand
+import httpx
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 
 # --- CONFIGURATION ---
@@ -18,8 +19,8 @@ if not TOKEN or not ALLOWED_USER_ID:
     sys.exit(1)
 
 ALLOWED_USER_ID = int(ALLOWED_USER_ID)
-DATA_FILE = "watchlist.json"
-CHECK_INTERVAL = 30 # Seconds between checks
+DB_FILE = "polytracker.db"
+CHECK_INTERVAL = 10 # Set Interval Here
 
 # Enable logging
 logging.basicConfig(
@@ -27,315 +28,328 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- DATA MANAGER ---
-def load_data():
-    """Loads the watchlist from a JSON file."""
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+# Global dictionary to track potential closes
+pending_deletes = {}
 
-def save_data(data):
-    """Saves the watchlist to a JSON file."""
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+# --- DATABASE MANAGER (SQLite) ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS wallets
+                 (address TEXT PRIMARY KEY, name TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS positions
+                 (asset_id TEXT, address TEXT, size REAL, avg_price REAL, 
+                  title TEXT, outcome TEXT, slug TEXT,
+                  PRIMARY KEY (asset_id, address))''')
+    conn.commit()
+    conn.close()
 
-# Global Watchlist variable (Loaded on startup)
-watchlist = load_data()
+def get_tracked_wallets():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT address, name FROM wallets")
+    data = {row[0]: row[1] for row in c.fetchall()}
+    conn.close()
+    return data
 
-# --- POLYMARKET API ---
-def fetch_positions(wallet):
+def get_wallet_positions(address):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT asset_id, size, avg_price, title, outcome, slug FROM positions WHERE address=?", (address,))
+    positions = {}
+    for row in c.fetchall():
+        positions[row[0]] = {
+            "size": row[1],
+            "avgPrice": row[2],
+            "title": row[3],
+            "outcome": row[4],
+            "slug": row[5]
+        }
+    conn.close()
+    return positions
+
+def upsert_position(address, asset_id, data):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO positions 
+                 (asset_id, address, size, avg_price, title, outcome, slug)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (asset_id, address, data['size'], data['avgPrice'], 
+               data['title'], data['outcome'], data['slug']))
+    conn.commit()
+    conn.close()
+
+def delete_position(address, asset_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM positions WHERE address=? AND asset_id=?", (address, asset_id))
+    conn.commit()
+    conn.close()
+
+def add_wallet_db(address, name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO wallets (address, name) VALUES (?, ?)", (address, name))
+    conn.commit()
+    conn.close()
+
+def remove_wallet_db(address):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM wallets WHERE address=?", (address,))
+    c.execute("DELETE FROM positions WHERE address=?", (address,))
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- ASYNC API FETCH ---
+async def fetch_positions(client, wallet):
     url = "https://data-api.polymarket.com/positions"
     params = {"user": wallet, "sortBy": "CURRENT", "sortDirection": "DESC"}
     try:
-        r = requests.get(url, params=params, timeout=10)
+        # Use the shared async client
+        r = await client.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
         logging.error(f"API Error for {wallet}: {e}")
         return None
 
-# --- COMMANDS ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 **PolyTracker Ready!**\n\n"
-        "Use `/help` to see how to use this bot.\n\n"
-        "Quick Commands:\n"
-        "`/add <address> <name>`\n"
-        "`/remove <name>`\n"
-        "`/list`",
-        parse_mode='Markdown'
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📚 **How to use PolyTracker**\n\n"
-        "1. **Find a Trader:** Go to Polymarket, find a user you want to copy (e.g., from the Leaderboard), and copy their 0x wallet address from the URL.\n"
-        "2. **Add to Watchlist:**\n"
-        "   Use: `/add <address> <name>`\n"
-        "   Example: `/add 0x8f0... TrumpWhale`\n\n"
-        "3. **Receive Alerts:**\n"
-        "   The bot checks every 60 seconds. You will receive alerts for:\n"
-        "   ✅ **New Bets**\n"
-        "   📈 **Increased Position**\n"
-        "   📉 **Decreased Position (Sold)**\n"
-        "   🚪 **Position Closed (Sold All/Redeemed)**\n\n"
-        "🛠 **All Commands:**\n"
-        "`/add <address> <name>` - Start tracking a wallet\n"
-        "`/remove <name>` - Stop tracking a wallet\n"
-        "`/list` - See currently tracked wallets\n"
-        "`/help` - Show this guide",
-        parse_mode='Markdown'
-    )
-
-async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Security check
-    if update.effective_user.id != ALLOWED_USER_ID:
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/add 0x123... WhaleName`", parse_mode='Markdown')
-        return
-
-    address = args[0]
-    name = " ".join(args[1:])
-
-    if not address.startswith("0x") or len(address) < 10:
-        await update.message.reply_text("❌ Invalid wallet address.")
-        return
-
-    # Add to memory and save
-    watchlist[address] = {"name": name, "positions": {}}
+# --- PROCESS SINGLE WALLET (Helper) ---
+async def process_wallet(client, context, address, name):
+    known_positions = get_wallet_positions(address)
+    current_positions = await fetch_positions(client, address)
     
-    # Initialize positions immediately to avoid alert spam on first run
-    msg = await update.message.reply_text(f"⏳ Initializing data for **{name}**...")
-    positions = fetch_positions(address)
-    
-    if positions:
-        for pos in positions:
-            # Safely get asset ID
-            asset = pos.get('asset', pos.get('conditionId'))
-            if asset:
-                # Store comprehensive data for smarter alerts
-                watchlist[address]["positions"][asset] = {
-                    "size": float(pos['size']),
-                    "avgPrice": float(pos.get('avgPrice', 0)),
-                    "title": pos.get('title', 'Unknown Event'),
-                    "outcome": pos.get('outcome', pos.get('outcomeLabel', 'Unknown')),
-                    "slug": pos.get('slug', '')
-                }
-    
-    save_data(watchlist)
-    await msg.edit_text(f"✅ Added **{name}** (`{address[:6]}...`) to tracker.", parse_mode='Markdown')
-
-async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ALLOWED_USER_ID: return
-
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("Usage: `/remove <name>` or `/remove <0xAddress>`", parse_mode='Markdown')
+    if current_positions is None: 
         return
 
-    target_key = None
-    for addr, data in watchlist.items():
-        if query.lower() in data['name'].lower() or query == addr:
-            target_key = addr
-            break
-
-    if target_key:
-        name = watchlist[target_key]['name']
-        del watchlist[target_key]
-        save_data(watchlist)
-        await update.message.reply_text(f"🗑️ Removed **{name}** from tracker.", parse_mode='Markdown')
-    else:
-        await update.message.reply_text(f"❌ Could not find wallet matching '{query}'.")
-
-async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not watchlist:
-        await update.message.reply_text("📭 No wallets being tracked.")
-        return
-
-    msg = "📋 **Tracked Wallets:**\n"
-    for addr, data in watchlist.items():
-        user_link = f"https://polymarket.com/profile/{addr}"
-        msg += f"• [**{data['name']}**]({user_link}): `{addr[:8]}...`\n"
+    clean_name = name.replace("_", " ") 
+    user_link = f"https://polymarket.com/profile/{address}"
+    name_linked = f"[{clean_name}]({user_link})"
     
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    current_asset_ids = set()
 
-# --- BACKGROUND TASK (The Tracker) ---
-async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
-    # Iterate over a COPY of keys to avoid issues if list changes during loop
-    for address in list(watchlist.keys()):
-        data = watchlist[address]
-        name = data['name']
+    # 1. PROCESS ACTIVE
+    for pos in current_positions:
+        asset_id = pos.get('asset', pos.get('conditionId'))
+        if not asset_id: continue
+
+        current_asset_ids.add(asset_id)
         
-        # FEATURE: Clickable User Name (FIXED FORMATTING)
-        # We replace underscore with space in name to prevent markdown errors
-        clean_name = name.replace("_", " ") 
-        user_link = f"https://polymarket.com/profile/{address}"
-        name_linked = f"[{clean_name}]({user_link})" # Removed the **asterisks** here
+        # Reset debounce
+        delete_key = f"{address}_{asset_id}"
+        if delete_key in pending_deletes:
+            del pending_deletes[delete_key]
+
+        new_size = float(pos['size'])
+        title = pos.get('title', 'Unknown Event')
+        outcome = pos.get('outcome', pos.get('outcomeLabel', 'Unknown'))
+        slug = pos.get('slug', '')
+        new_avg_price = float(pos.get('avgPrice', 0))
+
+        old_data = known_positions.get(asset_id)
+        old_size = 0.0
+        old_avg_price = 0.0
+
+        if old_data:
+            old_size = old_data['size']
+            old_avg_price = old_data['avgPrice']
         
-        known_positions = data['positions']
-        current_positions = fetch_positions(address)
+        new_data_block = {
+            "size": new_size,
+            "avgPrice": new_avg_price,
+            "title": title,
+            "outcome": outcome,
+            "slug": slug
+        }
+
+        market_link = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
         
-        # If API fails, skip this wallet for now
-        if current_positions is None: 
-            continue
+        keyboard = [[InlineKeyboardButton("🚀 View Market", url=market_link)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        current_asset_ids = set()
+        # Logic: New Position
+        if asset_id not in known_positions:
+            msg = (
+                f"✅ **NEW BET: {name_linked}**\n\n"
+                f"Event: {title}\n"
+                f"Pick: **{outcome}**\n"
+                f"Size: {new_size:.2f} Shares\n"
+                f"Avg Price: {new_avg_price:.2f}¢"
+            )
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
+                reply_markup=reply_markup, disable_web_page_preview=True
+            )
+            upsert_position(address, asset_id, new_data_block)
 
-        # Check for updates
-        for pos in current_positions:
-            asset_id = pos.get('asset', pos.get('conditionId'))
-            if not asset_id: continue
+        # Logic: Increased
+        elif new_size > old_size + 1.0:
+            diff = new_size - old_size
+            estimated_trade_price = new_avg_price
+            try:
+                cost_now = new_size * new_avg_price
+                cost_before = old_size * old_avg_price
+                if diff > 0:
+                    estimated_trade_price = (cost_now - cost_before) / diff
+                    if estimated_trade_price < 0: estimated_trade_price = 0
+            except: pass
 
-            current_asset_ids.add(asset_id)
+            msg = (
+                f"📈 **INCREASED: {name_linked}**\n\n"
+                f"Event: {title}\n"
+                f"Pick: **{outcome}**\n"
+                f"Added: +{diff:.2f} Shares\n"
+                f"Trade Price: ~{estimated_trade_price:.2f}¢\n"
+                f"(Avg: {old_avg_price:.2f}¢ ➜ {new_avg_price:.2f}¢)"
+            )
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
+                reply_markup=reply_markup, disable_web_page_preview=True
+            )
+            upsert_position(address, asset_id, new_data_block)
 
-            new_size = float(pos['size'])
-            title = pos.get('title', 'Unknown Event')
-            outcome = pos.get('outcome', pos.get('outcomeLabel', 'Unknown'))
-            slug = pos.get('slug', '')
-            new_avg_price = float(pos.get('avgPrice', 0)) # Current Average Price
+        # Logic: Decreased
+        elif new_size < old_size - 1.0:
+            diff = old_size - new_size
+            msg = (
+                f"📉 **SOLD: {name_linked}**\n\n"
+                f"Event: {title}\n"
+                f"Pick: **{outcome}**\n"
+                f"Sold: -{diff:.2f} Shares"
+            )
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
+                reply_markup=reply_markup, disable_web_page_preview=True
+            )
+            upsert_position(address, asset_id, new_data_block)
+        
+        else:
+            upsert_position(address, asset_id, new_data_block)
 
-            # --- HANDLE DATA MIGRATION (Float -> Dict) ---
-            old_data = known_positions.get(asset_id)
-            old_size = 0.0
-            old_avg_price = 0.0
-
-            if old_data is not None:
-                if isinstance(old_data, (int, float)):
-                    old_size = float(old_data)
-                elif isinstance(old_data, dict):
-                    old_size = float(old_data.get('size', 0.0))
-                    old_avg_price = float(old_data.get('avgPrice', 0.0))
+    # 2. PROCESS CLOSED (Debounced)
+    for asset_id, old_data in known_positions.items():
+        if asset_id not in current_asset_ids:
+            delete_key = f"{address}_{asset_id}"
+            pending_deletes[delete_key] = pending_deletes.get(delete_key, 0) + 1
             
-            # Prepare new data block to save
-            new_data_block = {
-                "size": new_size,
-                "avgPrice": new_avg_price,
-                "title": title,
-                "outcome": outcome,
-                "slug": slug
-            }
-
-            market_link = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
-
-            # Logic: New Position
-            if asset_id not in known_positions:
-                msg = (
-                    f"✅ **NEW BET: {name_linked}**\n\n"
-                    f"Event: {title}\n"
-                    f"Pick: **{outcome}**\n"
-                    f"Size: {new_size:.2f} Shares\n"
-                    f"Avg Price: {new_avg_price:.2f}¢\n\n"
-                    f"[View Market]({market_link})"
-                )
-                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown')
-                known_positions[asset_id] = new_data_block
-                save_data(watchlist)
-
-            # Logic: Increased Position (Buffer +1.0)
-            elif new_size > old_size + 1.0:
-                diff = new_size - old_size
-                
-                # FEATURE: Calculate Estimated Trade Price
-                estimated_trade_price = 0.0
-                try:
-                    cost_now = new_size * new_avg_price
-                    cost_before = old_size * old_avg_price
-                    if diff > 0:
-                        estimated_trade_price = (cost_now - cost_before) / diff
-                        if estimated_trade_price < 0: estimated_trade_price = 0
-                except:
-                    estimated_trade_price = new_avg_price
-
-                msg = (
-                    f"📈 **INCREASED: {name_linked}**\n\n"
-                    f"Event: {title}\n"
-                    f"Pick: **{outcome}**\n"
-                    f"Added: +{diff:.2f} Shares\n"
-                    f"Trade Price: ~{estimated_trade_price:.2f}¢\n"
-                    f"(Avg: {old_avg_price:.2f}¢ ➜ {new_avg_price:.2f}¢)\n\n"
-                    f"[View Market]({market_link})"
-                )
-                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown')
-                known_positions[asset_id] = new_data_block
-                save_data(watchlist)
-
-            # Logic: Decreased Position (Sold/Reduced)
-            elif new_size < old_size - 1.0:
-                diff = old_size - new_size
-                msg = (
-                    f"📉 **SOLD / DECREASED: {name_linked}**\n\n"
-                    f"Event: {title}\n"
-                    f"Pick: **{outcome}**\n"
-                    f"Sold: -{diff:.2f} Shares\n\n"
-                    f"[View Market]({market_link})"
-                )
-                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown')
-                known_positions[asset_id] = new_data_block
-                save_data(watchlist)
-            
-            else:
-                known_positions[asset_id] = new_data_block
-
-        # Logic: Position Completely Closed
-        for asset_id in list(known_positions.keys()):
-            if asset_id not in current_asset_ids:
-                old_data = known_positions[asset_id]
-                
-                if isinstance(old_data, (int, float)):
-                    t_title, t_outcome, t_slug = "Unknown Event (Legacy Data)", "Unknown", ""
-                else:
-                    t_title = old_data.get('title', 'Unknown Event')
-                    t_outcome = old_data.get('outcome', 'Unknown')
-                    t_slug = old_data.get('slug', '')
-
+            if pending_deletes[delete_key] >= 3:
+                t_title = old_data.get('title', 'Unknown Event')
+                t_outcome = old_data.get('outcome', 'Unknown')
+                t_slug = old_data.get('slug', '')
                 market_link = f"https://polymarket.com/event/{t_slug}" if t_slug else "https://polymarket.com"
                 
+                keyboard = [[InlineKeyboardButton("👀 View Market", url=market_link)]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
                 msg = (
                     f"🚪 **POSITION CLOSED: {name_linked}**\n\n"
                     f"Event: {t_title}\n"
                     f"Pick: **{t_outcome}**\n"
-                    f"Action: Sold All or Redeemed\n\n"
-                    f"[View Market]({market_link})"
+                    f"Action: Sold All or Redeemed"
                 )
-                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown')
-                
-                del known_positions[asset_id]
-                save_data(watchlist)
-        
-        await asyncio.sleep(1) 
+                await context.bot.send_message(
+                    chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
+                    reply_markup=reply_markup, disable_web_page_preview=True
+                )
+                delete_position(address, asset_id)
+                del pending_deletes[delete_key]
 
-# --- POST INIT (Sets the Menu) ---
+# --- MAIN TRACKER LOOP (Concurrent) ---
+async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
+    wallets = get_tracked_wallets()
+    
+    # Create a single HTTP client for all requests (Efficient!)
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        for address, name in wallets.items():
+            # Create a task for each wallet
+            tasks.append(process_wallet(client, context, address, name))
+        
+        # Run ALL tasks simultaneously
+        await asyncio.gather(*tasks)
+
+# --- COMMANDS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 **PolyTracker Ready (Async/SQLite)**")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
+
+async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: `/add 0x... Name`")
+        return
+    address = args[0]
+    name = " ".join(args[1:])
+    
+    msg = await update.message.reply_text(f"⏳ Syncing **{name}**...")
+    
+    # Use simple requests here since it's a one-off command
+    try:
+        r = requests.get("https://data-api.polymarket.com/positions", 
+                         params={"user": address, "sortBy": "CURRENT", "sortDirection": "DESC"})
+        positions = r.json()
+    except:
+        positions = []
+
+    add_wallet_db(address, name)
+    if positions:
+        for pos in positions:
+            asset = pos.get('asset', pos.get('conditionId'))
+            if asset:
+                data = {
+                    "size": float(pos['size']),
+                    "avgPrice": float(pos.get('avgPrice', 0)),
+                    "title": pos.get('title', 'Unknown'),
+                    "outcome": pos.get('outcome', 'Unknown'),
+                    "slug": pos.get('slug', '')
+                }
+                upsert_position(address, asset, data)
+    
+    await msg.edit_text(f"✅ Added **{name}**.")
+
+async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID: return
+    query = " ".join(context.args).lower()
+    wallets = get_tracked_wallets()
+    for addr, name in wallets.items():
+        if query in name.lower() or query == addr.lower():
+            remove_wallet_db(addr)
+            await update.message.reply_text(f"🗑️ Removed **{name}**.")
+            return
+    await update.message.reply_text("❌ Not found.")
+
+async def list_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wallets = get_tracked_wallets()
+    msg = "📋 **Tracked Wallets:**\n"
+    for addr, name in wallets.items():
+        msg += f"• [{name}](https://polymarket.com/profile/{addr})\n"
+    await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=True)
+
 async def post_init(application: Application):
-    """Sets the button menu when the bot starts."""
     await application.bot.set_my_commands([
-        BotCommand("start", "Start the bot"),
-        BotCommand("help", "Show help guide"),
-        BotCommand("add", "Track a wallet"),
-        BotCommand("remove", "Stop tracking a wallet"),
-        BotCommand("list", "List tracked wallets"),
+        BotCommand("start", "Start"),
+        BotCommand("add", "Add Wallet"),
+        BotCommand("remove", "Remove Wallet"),
+        BotCommand("list", "List Wallets"),
     ])
 
-# --- MAIN ---
 if __name__ == '__main__':
-    # KEY FIX FOR WINDOWS + PYTHON 3.13
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add", add_wallet))
     app.add_handler(CommandHandler("remove", remove_wallet))
     app.add_handler(CommandHandler("list", list_wallets))
 
-    job_queue = app.job_queue
-    job_queue.run_repeating(check_wallets, interval=CHECK_INTERVAL, first=5)
+    app.job_queue.run_repeating(check_wallets, interval=CHECK_INTERVAL, first=5)
 
     print("🤖 Bot is running...")
     app.run_polling()
