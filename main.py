@@ -178,6 +178,8 @@ async def process_wallet(client, context, address, name):
                 f"Size: {new_size:.2f} Shares\n"
                 f"Avg Price: {new_avg_price:.2f}¢"
             )
+            # REMOVED: [View Market] text link
+            # ADDED: disable_web_page_preview=True
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
                 reply_markup=reply_markup, disable_web_page_preview=True
@@ -258,16 +260,15 @@ async def process_wallet(client, context, address, name):
 
 # --- MAIN TRACKER LOOP (Concurrent) ---
 async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
+    # Fetch all wallets from DB
     wallets = get_tracked_wallets()
     
     # Create a single HTTP client for all requests (Efficient!)
     async with httpx.AsyncClient() as client:
         tasks = []
         for address, name in wallets.items():
-            # Create a task for each wallet
             tasks.append(process_wallet(client, context, address, name))
         
-        # Run ALL tasks simultaneously
         await asyncio.gather(*tasks)
 
 # --- COMMANDS ---
