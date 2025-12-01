@@ -5,7 +5,7 @@ import os
 import sys
 import sqlite3
 from dotenv import load_dotenv
-import httpx
+import httpx 
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 
@@ -20,7 +20,7 @@ if not TOKEN or not ALLOWED_USER_ID:
 
 ALLOWED_USER_ID = int(ALLOWED_USER_ID)
 DB_FILE = "polytracker.db"
-CHECK_INTERVAL = 10 # Set Interval Here
+CHECK_INTERVAL = 10 
 
 # Enable logging
 logging.basicConfig(
@@ -28,8 +28,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Global dictionary to track potential closes
+# Global trackers
 pending_deletes = {}
+category_cache = {} # Cache for event categories (EventID -> Category Name)
 
 # --- DATABASE MANAGER (SQLite) ---
 def init_db():
@@ -103,12 +104,11 @@ def remove_wallet_db(address):
 
 init_db()
 
-# --- ASYNC API FETCH ---
+# --- ASYNC API HELPER ---
 async def fetch_positions(client, wallet):
     url = "https://data-api.polymarket.com/positions"
     params = {"user": wallet, "sortBy": "CURRENT", "sortDirection": "DESC"}
     try:
-        # Use the shared async client
         r = await client.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
@@ -116,7 +116,33 @@ async def fetch_positions(client, wallet):
         logging.error(f"API Error for {wallet}: {e}")
         return None
 
-# --- PROCESS SINGLE WALLET (Helper) ---
+async def get_event_category(client, event_id):
+    """Fetches the category (Sport/Topic) for an event. Caches results."""
+    if not event_id: return ""
+    if event_id in category_cache:
+        return category_cache[event_id]
+    
+    url = f"https://gamma-api.polymarket.com/events/{event_id}"
+    try:
+        r = await client.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if 'markets' in data and len(data['markets']) > 0:
+                cat = data['markets'][0].get('category', '')
+                if cat:
+                    if "Football" in cat or "Soccer" in cat: cat = f"⚽ {cat}"
+                    elif "Basketball" in cat or "NBA" in cat: cat = f"🏀 {cat}"
+                    elif "Esports" in cat or "Gaming" in cat: cat = f"🎮 {cat}"
+                    elif "Politics" in cat: cat = f"🏛️ {cat}"
+                    elif "Crypto" in cat: cat = f"₿ {cat}"
+                    
+                    category_cache[event_id] = cat
+                    return cat
+    except:
+        pass
+    return ""
+
+# --- PROCESS SINGLE WALLET ---
 async def process_wallet(client, context, address, name):
     known_positions = get_wallet_positions(address)
     current_positions = await fetch_positions(client, address)
@@ -137,7 +163,7 @@ async def process_wallet(client, context, address, name):
 
         current_asset_ids.add(asset_id)
         
-        # Reset debounce
+        # Debounce reset
         delete_key = f"{address}_{asset_id}"
         if delete_key in pending_deletes:
             del pending_deletes[delete_key]
@@ -147,6 +173,14 @@ async def process_wallet(client, context, address, name):
         outcome = pos.get('outcome', pos.get('outcomeLabel', 'Unknown'))
         slug = pos.get('slug', '')
         new_avg_price = float(pos.get('avgPrice', 0))
+        event_id = pos.get('eventId')
+
+        # Fetch Category (Lazy load)
+        category = await get_event_category(client, event_id)
+        if category:
+            display_title = f"**{category}** | {title}"
+        else:
+            display_title = title
 
         old_data = known_positions.get(asset_id)
         old_size = 0.0
@@ -171,15 +205,15 @@ async def process_wallet(client, context, address, name):
 
         # Logic: New Position
         if asset_id not in known_positions:
+            total_value = new_size * new_avg_price
             msg = (
                 f"✅ **NEW BET: {name_linked}**\n\n"
-                f"Event: {title}\n"
+                f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
-                f"Size: {new_size:.2f} Shares\n"
+                f"💰 **Value: ${total_value:,.2f}**\n"
+                f"Size: {new_size:,.2f} Shares\n"
                 f"Avg Price: {new_avg_price:.2f}¢"
             )
-            # REMOVED: [View Market] text link
-            # ADDED: disable_web_page_preview=True
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
                 reply_markup=reply_markup, disable_web_page_preview=True
@@ -190,19 +224,24 @@ async def process_wallet(client, context, address, name):
         elif new_size > old_size + 1.0:
             diff = new_size - old_size
             estimated_trade_price = new_avg_price
+            
+            # Calculate Value of the ADDED amount
+            added_value = 0.0
             try:
                 cost_now = new_size * new_avg_price
                 cost_before = old_size * old_avg_price
+                added_value = cost_now - cost_before
                 if diff > 0:
-                    estimated_trade_price = (cost_now - cost_before) / diff
+                    estimated_trade_price = added_value / diff
                     if estimated_trade_price < 0: estimated_trade_price = 0
             except: pass
 
             msg = (
                 f"📈 **INCREASED: {name_linked}**\n\n"
-                f"Event: {title}\n"
+                f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
-                f"Added: +{diff:.2f} Shares\n"
+                f"💰 **Added: ${added_value:,.2f}**\n"
+                f"Shares: +{diff:,.2f}\n"
                 f"Trade Price: ~{estimated_trade_price:.2f}¢\n"
                 f"(Avg: {old_avg_price:.2f}¢ ➜ {new_avg_price:.2f}¢)"
             )
@@ -215,11 +254,15 @@ async def process_wallet(client, context, address, name):
         # Logic: Decreased
         elif new_size < old_size - 1.0:
             diff = old_size - new_size
+            # Estimate sold value based on current price
+            sold_value = diff * new_avg_price 
+            
             msg = (
                 f"📉 **SOLD: {name_linked}**\n\n"
-                f"Event: {title}\n"
+                f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
-                f"Sold: -{diff:.2f} Shares"
+                f"💰 **Sold Value: ~${sold_value:,.2f}**\n"
+                f"Shares: -{diff:,.2f}"
             )
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
@@ -240,8 +283,8 @@ async def process_wallet(client, context, address, name):
                 t_title = old_data.get('title', 'Unknown Event')
                 t_outcome = old_data.get('outcome', 'Unknown')
                 t_slug = old_data.get('slug', '')
-                market_link = f"https://polymarket.com/event/{t_slug}" if t_slug else "https://polymarket.com"
                 
+                market_link = f"https://polymarket.com/event/{t_slug}" if t_slug else "https://polymarket.com"
                 keyboard = [[InlineKeyboardButton("👀 View Market", url=market_link)]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -258,22 +301,18 @@ async def process_wallet(client, context, address, name):
                 delete_position(address, asset_id)
                 del pending_deletes[delete_key]
 
-# --- MAIN TRACKER LOOP (Concurrent) ---
+# --- MAIN TRACKER LOOP ---
 async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
-    # Fetch all wallets from DB
     wallets = get_tracked_wallets()
-    
-    # Create a single HTTP client for all requests (Efficient!)
     async with httpx.AsyncClient() as client:
         tasks = []
         for address, name in wallets.items():
             tasks.append(process_wallet(client, context, address, name))
-        
         await asyncio.gather(*tasks)
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (Async/SQLite)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
@@ -289,7 +328,6 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text(f"⏳ Syncing **{name}**...")
     
-    # Use simple requests here since it's a one-off command
     try:
         r = requests.get("https://data-api.polymarket.com/positions", 
                          params={"user": address, "sortBy": "CURRENT", "sortDirection": "DESC"})
