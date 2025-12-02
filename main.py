@@ -20,7 +20,7 @@ if not TOKEN or not ALLOWED_USER_ID:
 
 ALLOWED_USER_ID = int(ALLOWED_USER_ID)
 DB_FILE = "polytracker.db"
-CHECK_INTERVAL = 10 
+CHECK_INTERVAL = 3
 
 # Enable logging
 logging.basicConfig(
