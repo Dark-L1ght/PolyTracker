@@ -116,6 +116,18 @@ async def fetch_positions(client, wallet):
         logging.error(f"API Error for {wallet}: {e}")
         return None
 
+async def fetch_recent_trades(client, wallet):
+    """Fetches recent trades to find execution price for PnL calculation."""
+    url = "https://data-api.polymarket.com/trades"
+    params = {"user": wallet, "limit": 20}
+    try:
+        r = await client.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logging.error(f"Trades API Error: {e}")
+    return []
+
 async def get_event_category(client, event_id):
     """Fetches the category (Sport/Topic) for an event. Caches results."""
     if not event_id: return ""
@@ -175,6 +187,9 @@ async def process_wallet(client, context, address, name):
         new_avg_price = float(pos.get('avgPrice', 0))
         event_id = pos.get('eventId')
 
+        # Calculate current total value of position
+        current_total_value = new_size * new_avg_price
+
         # Fetch Category (Lazy load)
         category = await get_event_category(client, event_id)
         if category:
@@ -205,12 +220,11 @@ async def process_wallet(client, context, address, name):
 
         # Logic: New Position
         if asset_id not in known_positions:
-            total_value = new_size * new_avg_price
             msg = (
                 f"✅ **NEW BET: {name_linked}**\n\n"
                 f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
-                f"💰 **Value: ${total_value:,.2f}**\n"
+                f"💰 **Value: ${current_total_value:,.2f}**\n"
                 f"Size: {new_size:,.2f} Shares\n"
                 f"Avg Price: {new_avg_price:.2f}¢"
             )
@@ -241,6 +255,7 @@ async def process_wallet(client, context, address, name):
                 f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
                 f"💰 **Added: ${added_value:,.2f}**\n"
+                f"💰 **Position Total: ${current_total_value:,.2f}**\n"
                 f"Shares: +{diff:,.2f}\n"
                 f"Trade Price: ~{estimated_trade_price:.2f}¢\n"
                 f"(Avg: {old_avg_price:.2f}¢ ➜ {new_avg_price:.2f}¢)"
@@ -254,15 +269,37 @@ async def process_wallet(client, context, address, name):
         # Logic: Decreased
         elif new_size < old_size - 1.0:
             diff = old_size - new_size
-            # Estimate sold value based on current price
-            sold_value = diff * new_avg_price 
             
+            # Fetch real trade data to get execution price & PnL
+            trades = await fetch_recent_trades(client, address)
+            trade_price = new_avg_price # fallback
+            found_trade = False
+            
+            if trades:
+                for t in trades:
+                    if t.get("asset") == asset_id and t.get("side") == "SELL":
+                        trade_price = float(t.get("price", 0))
+                        found_trade = True
+                        break
+            
+            sold_value = diff * trade_price
+            
+            # PnL Calculation
+            pnl_msg = ""
+            if found_trade and old_avg_price > 0:
+                pnl = (trade_price - old_avg_price) * diff
+                pnl_percent = ((trade_price - old_avg_price) / old_avg_price) * 100
+                symbol = "+" if pnl >= 0 else "-"
+                pnl_msg = f"\n💵 **Realized PnL: {symbol}${abs(pnl):,.2f} ({pnl_percent:+.2f}%)**"
+
             msg = (
                 f"📉 **SOLD: {name_linked}**\n\n"
                 f"Event: {display_title}\n"
                 f"Pick: **{outcome}**\n"
-                f"💰 **Sold Value: ~${sold_value:,.2f}**\n"
-                f"Shares: -{diff:,.2f}"
+                f"💰 **Sold Value: ${sold_value:,.2f}**"
+                f"{pnl_msg}\n"
+                f"Shares: -{diff:,.2f}\n"
+                f"Sell Price: {trade_price:.2f}¢"
             )
             await context.bot.send_message(
                 chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
@@ -284,6 +321,29 @@ async def process_wallet(client, context, address, name):
                 t_outcome = old_data.get('outcome', 'Unknown')
                 t_slug = old_data.get('slug', '')
                 
+                # Fetch Trades for PnL
+                trades = await fetch_recent_trades(client, address)
+                trade_price = 0.0
+                found_trade = False
+                
+                if trades:
+                    for t in trades:
+                        if t.get("asset") == asset_id and t.get("side") == "SELL":
+                            trade_price = float(t.get("price", 0))
+                            found_trade = True
+                            break
+                
+                # PnL Calc
+                pnl_msg = ""
+                old_avg = old_data.get('avgPrice', 0.0)
+                size_closed = old_data.get('size', 0.0)
+                
+                if found_trade and old_avg > 0:
+                    pnl = (trade_price - old_avg) * size_closed
+                    pnl_percent = ((trade_price - old_avg) / old_avg) * 100
+                    symbol = "+" if pnl >= 0 else "-"
+                    pnl_msg = f"\n💵 **Closed PnL: {symbol}${abs(pnl):,.2f} ({pnl_percent:+.2f}%)**"
+                
                 market_link = f"https://polymarket.com/event/{t_slug}" if t_slug else "https://polymarket.com"
                 keyboard = [[InlineKeyboardButton("👀 View Market", url=market_link)]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -291,7 +351,8 @@ async def process_wallet(client, context, address, name):
                 msg = (
                     f"🚪 **POSITION CLOSED: {name_linked}**\n\n"
                     f"Event: {t_title}\n"
-                    f"Pick: **{t_outcome}**\n"
+                    f"Pick: **{t_outcome}**"
+                    f"{pnl_msg}\n"
                     f"Action: Sold All or Redeemed"
                 )
                 await context.bot.send_message(
@@ -312,7 +373,7 @@ async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$ + PnL)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
