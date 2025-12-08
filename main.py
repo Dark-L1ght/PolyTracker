@@ -30,7 +30,7 @@ logging.basicConfig(
 
 # Global trackers
 pending_deletes = {}
-category_cache = {} # Cache for event categories (EventID -> Category Name)
+category_cache = {} 
 
 # --- DATABASE MANAGER (SQLite) ---
 def init_db():
@@ -38,10 +38,19 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS wallets
                  (address TEXT PRIMARY KEY, name TEXT)''')
+    
+    # Create positions table (Older schema check)
     c.execute('''CREATE TABLE IF NOT EXISTS positions
                  (asset_id TEXT, address TEXT, size REAL, avg_price REAL, 
                   title TEXT, outcome TEXT, slug TEXT,
                   PRIMARY KEY (asset_id, address))''')
+    
+    # MIGRATION: Add condition_id column if it doesn't exist
+    try:
+        c.execute("ALTER TABLE positions ADD COLUMN condition_id TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+        
     conn.commit()
     conn.close()
 
@@ -55,16 +64,18 @@ def get_tracked_wallets():
 
 def get_wallet_positions(address):
     conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row # Access columns by name
     c = conn.cursor()
-    c.execute("SELECT asset_id, size, avg_price, title, outcome, slug FROM positions WHERE address=?", (address,))
+    c.execute("SELECT * FROM positions WHERE address=?", (address,))
     positions = {}
     for row in c.fetchall():
-        positions[row[0]] = {
-            "size": row[1],
-            "avgPrice": row[2],
-            "title": row[3],
-            "outcome": row[4],
-            "slug": row[5]
+        positions[row['asset_id']] = {
+            "size": row['size'],
+            "avgPrice": row['avg_price'],
+            "title": row['title'],
+            "outcome": row['outcome'],
+            "slug": row['slug'],
+            "conditionId": row['condition_id'] if 'condition_id' in row.keys() else None
         }
     conn.close()
     return positions
@@ -73,10 +84,10 @@ def upsert_position(address, asset_id, data):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO positions 
-                 (asset_id, address, size, avg_price, title, outcome, slug)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                 (asset_id, address, size, avg_price, title, outcome, slug, condition_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
               (asset_id, address, data['size'], data['avgPrice'], 
-               data['title'], data['outcome'], data['slug']))
+               data['title'], data['outcome'], data['slug'], data['conditionId']))
     conn.commit()
     conn.close()
 
@@ -116,23 +127,35 @@ async def fetch_positions(client, wallet):
         logging.error(f"API Error for {wallet}: {e}")
         return None
 
-async def fetch_recent_trades(client, wallet):
-    """Fetches recent trades to find execution price for PnL calculation."""
-    url = "https://data-api.polymarket.com/trades"
-    params = {"user": wallet, "limit": 20}
+async def fetch_recent_activity(client, wallet):
+    """Fetches trades AND redemptions to find PnL."""
+    trades_url = "https://data-api.polymarket.com/trades"
+    activity_url = "https://data-api.polymarket.com/activity"
+    
+    trades = []
+    activity = []
+    
     try:
-        r = await client.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json()
+        # Fetch both concurrently
+        r1, r2 = await asyncio.gather(
+            client.get(trades_url, params={"user": wallet, "limit": 20}, timeout=10),
+            client.get(activity_url, params={"user": wallet, "limit": 20}, timeout=10),
+            return_exceptions=True
+        )
+        
+        if isinstance(r1, httpx.Response) and r1.status_code == 200:
+            trades = r1.json()
+        if isinstance(r2, httpx.Response) and r2.status_code == 200:
+            activity = r2.json()
+            
     except Exception as e:
-        logging.error(f"Trades API Error: {e}")
-    return []
+        logging.error(f"Activity/Trades Fetch Error: {e}")
+    
+    return trades, activity
 
 async def get_event_category(client, event_id):
-    """Fetches the category (Sport/Topic) for an event. Caches results."""
     if not event_id: return ""
-    if event_id in category_cache:
-        return category_cache[event_id]
+    if event_id in category_cache: return category_cache[event_id]
     
     url = f"https://gamma-api.polymarket.com/events/{event_id}"
     try:
@@ -150,8 +173,7 @@ async def get_event_category(client, event_id):
                     
                     category_cache[event_id] = cat
                     return cat
-    except:
-        pass
+    except: pass
     return ""
 
 # --- PROCESS SINGLE WALLET ---
@@ -175,7 +197,6 @@ async def process_wallet(client, context, address, name):
 
         current_asset_ids.add(asset_id)
         
-        # Debounce reset
         delete_key = f"{address}_{asset_id}"
         if delete_key in pending_deletes:
             del pending_deletes[delete_key]
@@ -186,11 +207,10 @@ async def process_wallet(client, context, address, name):
         slug = pos.get('slug', '')
         new_avg_price = float(pos.get('avgPrice', 0))
         event_id = pos.get('eventId')
+        condition_id = pos.get('conditionId')
 
-        # Calculate current total value of position
         current_total_value = new_size * new_avg_price
 
-        # Fetch Category (Lazy load)
         category = await get_event_category(client, event_id)
         if category:
             display_title = f"**{category}** | {title}"
@@ -210,11 +230,11 @@ async def process_wallet(client, context, address, name):
             "avgPrice": new_avg_price,
             "title": title,
             "outcome": outcome,
-            "slug": slug
+            "slug": slug,
+            "conditionId": condition_id
         }
 
         market_link = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
-        
         keyboard = [[InlineKeyboardButton("🚀 View Market", url=market_link)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -228,10 +248,7 @@ async def process_wallet(client, context, address, name):
                 f"Size: {new_size:,.2f} Shares\n"
                 f"Avg Price: {new_avg_price:.2f}¢"
             )
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
-                reply_markup=reply_markup, disable_web_page_preview=True
-            )
+            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
             upsert_position(address, asset_id, new_data_block)
 
         # Logic: Increased
@@ -239,7 +256,6 @@ async def process_wallet(client, context, address, name):
             diff = new_size - old_size
             estimated_trade_price = new_avg_price
             
-            # Calculate Value of the ADDED amount
             added_value = 0.0
             try:
                 cost_now = new_size * new_avg_price
@@ -260,19 +276,16 @@ async def process_wallet(client, context, address, name):
                 f"Trade Price: ~{estimated_trade_price:.2f}¢\n"
                 f"(Avg: {old_avg_price:.2f}¢ ➜ {new_avg_price:.2f}¢)"
             )
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
-                reply_markup=reply_markup, disable_web_page_preview=True
-            )
+            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
             upsert_position(address, asset_id, new_data_block)
 
         # Logic: Decreased
         elif new_size < old_size - 1.0:
             diff = old_size - new_size
             
-            # Fetch real trade data to get execution price & PnL
-            trades = await fetch_recent_trades(client, address)
-            trade_price = new_avg_price # fallback
+            # Fetch for partial sell PnL
+            trades, _ = await fetch_recent_activity(client, address)
+            trade_price = new_avg_price
             found_trade = False
             
             if trades:
@@ -283,8 +296,6 @@ async def process_wallet(client, context, address, name):
                         break
             
             sold_value = diff * trade_price
-            
-            # PnL Calculation
             pnl_msg = ""
             if found_trade and old_avg_price > 0:
                 pnl = (trade_price - old_avg_price) * diff
@@ -301,10 +312,7 @@ async def process_wallet(client, context, address, name):
                 f"Shares: -{diff:,.2f}\n"
                 f"Sell Price: {trade_price:.2f}¢"
             )
-            await context.bot.send_message(
-                chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
-                reply_markup=reply_markup, disable_web_page_preview=True
-            )
+            await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
             upsert_position(address, asset_id, new_data_block)
         
         else:
@@ -320,27 +328,47 @@ async def process_wallet(client, context, address, name):
                 t_title = old_data.get('title', 'Unknown Event')
                 t_outcome = old_data.get('outcome', 'Unknown')
                 t_slug = old_data.get('slug', '')
+                t_condition = old_data.get('conditionId', '') # Get saved market ID
                 
-                # Fetch Trades for PnL
-                trades = await fetch_recent_trades(client, address)
+                # Fetch BOTH Trades and Activity
+                trades, activity = await fetch_recent_activity(client, address)
+                
                 trade_price = 0.0
-                found_trade = False
+                exit_type = "Expired / Lost"
+                found_exit = False
                 
+                # Check 1: Did they Sell?
                 if trades:
                     for t in trades:
                         if t.get("asset") == asset_id and t.get("side") == "SELL":
                             trade_price = float(t.get("price", 0))
-                            found_trade = True
+                            exit_type = "Sold All"
+                            found_exit = True
                             break
                 
-                # PnL Calc
+                # Check 2: Did they Redeem? (If no sell found)
+                if not found_exit and activity:
+                    for a in activity:
+                        # Redemption matches by conditionId (Market ID), not Asset ID (Token ID)
+                        if a.get("type") == "REDEEM" and a.get("conditionId") == t_condition:
+                            trade_price = 1.00 # Redemptions are always $1.00 per share
+                            exit_type = "Redeemed (Won)"
+                            found_exit = True
+                            break
+                
+                # Check 3: If neither, assume Loss (Expired at 0)
+                if not found_exit:
+                    trade_price = 0.0
+                    exit_type = "Expired (Lost)"
+
+                # Calculate PnL
                 pnl_msg = ""
                 old_avg = old_data.get('avgPrice', 0.0)
                 size_closed = old_data.get('size', 0.0)
                 
-                if found_trade and old_avg > 0:
+                if old_avg > 0:
                     pnl = (trade_price - old_avg) * size_closed
-                    pnl_percent = ((trade_price - old_avg) / old_avg) * 100
+                    pnl_percent = -100.0 if trade_price == 0 else ((trade_price - old_avg) / old_avg) * 100
                     symbol = "+" if pnl >= 0 else "-"
                     pnl_msg = f"\n💵 **Closed PnL: {symbol}${abs(pnl):,.2f} ({pnl_percent:+.2f}%)**"
                 
@@ -353,12 +381,10 @@ async def process_wallet(client, context, address, name):
                     f"Event: {t_title}\n"
                     f"Pick: **{t_outcome}**"
                     f"{pnl_msg}\n"
-                    f"Action: Sold All or Redeemed"
+                    f"Action: {exit_type}\n"
+                    f"Exit Price: ${trade_price:.2f}"
                 )
-                await context.bot.send_message(
-                    chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', 
-                    reply_markup=reply_markup, disable_web_page_preview=True
-                )
+                await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=msg, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
                 delete_position(address, asset_id)
                 del pending_deletes[delete_key]
 
@@ -373,7 +399,7 @@ async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$ + PnL)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$ + Full PnL)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
@@ -406,7 +432,8 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "avgPrice": float(pos.get('avgPrice', 0)),
                     "title": pos.get('title', 'Unknown'),
                     "outcome": pos.get('outcome', 'Unknown'),
-                    "slug": pos.get('slug', '')
+                    "slug": pos.get('slug', ''),
+                    "conditionId": pos.get('conditionId', '')
                 }
                 upsert_position(address, asset, data)
     
