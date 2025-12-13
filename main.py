@@ -6,6 +6,7 @@ import sys
 import sqlite3
 from dotenv import load_dotenv
 import httpx 
+import requests
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 
@@ -38,19 +39,14 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS wallets
                  (address TEXT PRIMARY KEY, name TEXT)''')
-    
-    # Create positions table (Older schema check)
     c.execute('''CREATE TABLE IF NOT EXISTS positions
                  (asset_id TEXT, address TEXT, size REAL, avg_price REAL, 
                   title TEXT, outcome TEXT, slug TEXT,
                   PRIMARY KEY (asset_id, address))''')
-    
-    # MIGRATION: Add condition_id column if it doesn't exist
     try:
         c.execute("ALTER TABLE positions ADD COLUMN condition_id TEXT")
     except sqlite3.OperationalError:
-        pass # Column already exists
-        
+        pass
     conn.commit()
     conn.close()
 
@@ -64,7 +60,7 @@ def get_tracked_wallets():
 
 def get_wallet_positions(address):
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row # Access columns by name
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM positions WHERE address=?", (address,))
     positions = {}
@@ -115,42 +111,58 @@ def remove_wallet_db(address):
 
 init_db()
 
-# --- ASYNC API HELPER ---
+# --- ASYNC API HELPER (With Pagination) ---
 async def fetch_positions(client, wallet):
     url = "https://data-api.polymarket.com/positions"
-    params = {"user": wallet, "sortBy": "CURRENT", "sortDirection": "DESC"}
+    all_positions = []
+    limit = 500 # Max limit to reduce requests
+    offset = 0
+    
     try:
-        r = await client.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        while True:
+            params = {
+                "user": wallet, 
+                "sortBy": "CURRENT", 
+                "sortDirection": "DESC",
+                "limit": limit,
+                "offset": offset
+            }
+            r = await client.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            
+            if not data:
+                break
+                
+            all_positions.extend(data)
+            
+            if len(data) < limit:
+                break
+            
+            offset += limit
+            
+        return all_positions
     except Exception as e:
         logging.error(f"API Error for {wallet}: {e}")
         return None
 
 async def fetch_recent_activity(client, wallet):
-    """Fetches trades AND redemptions to find PnL."""
     trades_url = "https://data-api.polymarket.com/trades"
     activity_url = "https://data-api.polymarket.com/activity"
-    
     trades = []
     activity = []
-    
     try:
-        # Fetch both concurrently
         r1, r2 = await asyncio.gather(
             client.get(trades_url, params={"user": wallet, "limit": 20}, timeout=10),
             client.get(activity_url, params={"user": wallet, "limit": 20}, timeout=10),
             return_exceptions=True
         )
-        
         if isinstance(r1, httpx.Response) and r1.status_code == 200:
             trades = r1.json()
         if isinstance(r2, httpx.Response) and r2.status_code == 200:
             activity = r2.json()
-            
     except Exception as e:
-        logging.error(f"Activity/Trades Fetch Error: {e}")
-    
+        logging.error(f"Activity Fetch Error: {e}")
     return trades, activity
 
 async def get_event_category(client, event_id):
@@ -170,7 +182,6 @@ async def get_event_category(client, event_id):
                     elif "Esports" in cat or "Gaming" in cat: cat = f"🎮 {cat}"
                     elif "Politics" in cat: cat = f"🏛️ {cat}"
                     elif "Crypto" in cat: cat = f"₿ {cat}"
-                    
                     category_cache[event_id] = cat
                     return cat
     except: pass
@@ -283,7 +294,6 @@ async def process_wallet(client, context, address, name):
         elif new_size < old_size - 1.0:
             diff = old_size - new_size
             
-            # Fetch for partial sell PnL
             trades, _ = await fetch_recent_activity(client, address)
             trade_price = new_avg_price
             found_trade = False
@@ -328,16 +338,14 @@ async def process_wallet(client, context, address, name):
                 t_title = old_data.get('title', 'Unknown Event')
                 t_outcome = old_data.get('outcome', 'Unknown')
                 t_slug = old_data.get('slug', '')
-                t_condition = old_data.get('conditionId', '') # Get saved market ID
+                t_condition = old_data.get('conditionId', '')
                 
-                # Fetch BOTH Trades and Activity
                 trades, activity = await fetch_recent_activity(client, address)
                 
                 trade_price = 0.0
                 exit_type = "Expired / Lost"
                 found_exit = False
                 
-                # Check 1: Did they Sell?
                 if trades:
                     for t in trades:
                         if t.get("asset") == asset_id and t.get("side") == "SELL":
@@ -346,22 +354,18 @@ async def process_wallet(client, context, address, name):
                             found_exit = True
                             break
                 
-                # Check 2: Did they Redeem? (If no sell found)
                 if not found_exit and activity:
                     for a in activity:
-                        # Redemption matches by conditionId (Market ID), not Asset ID (Token ID)
                         if a.get("type") == "REDEEM" and a.get("conditionId") == t_condition:
-                            trade_price = 1.00 # Redemptions are always $1.00 per share
+                            trade_price = 1.00 
                             exit_type = "Redeemed (Won)"
                             found_exit = True
                             break
                 
-                # Check 3: If neither, assume Loss (Expired at 0)
                 if not found_exit:
                     trade_price = 0.0
                     exit_type = "Expired (Lost)"
 
-                # Calculate PnL
                 pnl_msg = ""
                 old_avg = old_data.get('avgPrice', 0.0)
                 size_closed = old_data.get('size', 0.0)
@@ -399,7 +403,7 @@ async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + Categories + $$$ + Full PnL)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (Paginated)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
@@ -415,16 +419,26 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text(f"⏳ Syncing **{name}**...")
     
+    # Sync Pagination Logic for Add
+    all_positions = []
+    limit = 500
+    offset = 0
     try:
-        r = requests.get("https://data-api.polymarket.com/positions", 
-                         params={"user": address, "sortBy": "CURRENT", "sortDirection": "DESC"})
-        positions = r.json()
+        while True:
+            r = requests.get("https://data-api.polymarket.com/positions", 
+                             params={"user": address, "sortBy": "CURRENT", "sortDirection": "DESC", "limit": limit, "offset": offset})
+            data = r.json()
+            if not data: break
+            all_positions.extend(data)
+            if len(data) < limit: break
+            offset += limit
     except:
-        positions = []
+        all_positions = []
 
     add_wallet_db(address, name)
-    if positions:
-        for pos in positions:
+    
+    if all_positions:
+        for pos in all_positions:
             asset = pos.get('asset', pos.get('conditionId'))
             if asset:
                 data = {
@@ -437,7 +451,7 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
                 upsert_position(address, asset, data)
     
-    await msg.edit_text(f"✅ Added **{name}**.")
+    await msg.edit_text(f"✅ Added **{name}** ({len(all_positions)} positions synced).")
 
 async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
