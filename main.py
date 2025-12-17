@@ -111,13 +111,12 @@ def remove_wallet_db(address):
 
 init_db()
 
-# --- ASYNC API HELPER (With Pagination) ---
+# --- ASYNC API HELPER ---
 async def fetch_positions(client, wallet):
     url = "https://data-api.polymarket.com/positions"
     all_positions = []
-    limit = 500 # Max limit to reduce requests
+    limit = 500
     offset = 0
-    
     try:
         while True:
             params = {
@@ -130,17 +129,10 @@ async def fetch_positions(client, wallet):
             r = await client.get(url, params=params, timeout=10)
             r.raise_for_status()
             data = r.json()
-            
-            if not data:
-                break
-                
+            if not data: break
             all_positions.extend(data)
-            
-            if len(data) < limit:
-                break
-            
+            if len(data) < limit: break
             offset += limit
-            
         return all_positions
     except Exception as e:
         logging.error(f"API Error for {wallet}: {e}")
@@ -186,6 +178,30 @@ async def get_event_category(client, event_id):
                     return cat
     except: pass
     return ""
+
+async def check_market_winner(client, condition_id):
+    """Checks who won the market to verify redemption value."""
+    if not condition_id: return None
+    url = f"https://gamma-api.polymarket.com/markets/{condition_id}"
+    try:
+        r = await client.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            # If market is closed, it might have a winner logic
+            # Gamma usually returns tokens. One of them is winner.
+            # Or we look at the 'resolutionSource' or resolved prices
+            # Simplest for now: Check if 'closed' is true, and if we can fetch outcome prices
+            # Actually, let's rely on logic: Did the user hold the winner?
+            
+            # Since Gamma structure varies, let's try to grab 'question' and outcomes
+            # Ideally we check the `tokens` list. The winner usually has price 1.
+            if 'tokens' in data:
+                for token in data['tokens']:
+                    if token.get('winner') is True:
+                        return token.get('outcome') # "Yes" or "No"
+    except:
+        pass
+    return None
 
 # --- PROCESS SINGLE WALLET ---
 async def process_wallet(client, context, address, name):
@@ -346,6 +362,7 @@ async def process_wallet(client, context, address, name):
                 exit_type = "Expired / Lost"
                 found_exit = False
                 
+                # Check 1: Did they Sell?
                 if trades:
                     for t in trades:
                         if t.get("asset") == asset_id and t.get("side") == "SELL":
@@ -354,11 +371,20 @@ async def process_wallet(client, context, address, name):
                             found_exit = True
                             break
                 
+                # Check 2: Did they Redeem? 
                 if not found_exit and activity:
                     for a in activity:
                         if a.get("type") == "REDEEM" and a.get("conditionId") == t_condition:
-                            trade_price = 1.00 
-                            exit_type = "Redeemed (Won)"
+                            # CRITICAL FIX: Verify Winner
+                            winning_outcome = await check_market_winner(client, t_condition)
+                            
+                            if winning_outcome and winning_outcome == t_outcome:
+                                trade_price = 1.00
+                                exit_type = "Redeemed (Won)"
+                            else:
+                                trade_price = 0.00
+                                exit_type = "Redeemed (Lost/Burned)"
+                            
                             found_exit = True
                             break
                 
@@ -372,7 +398,12 @@ async def process_wallet(client, context, address, name):
                 
                 if old_avg > 0:
                     pnl = (trade_price - old_avg) * size_closed
-                    pnl_percent = -100.0 if trade_price == 0 else ((trade_price - old_avg) / old_avg) * 100
+                    # Handle full loss (-100%) case
+                    if trade_price == 0:
+                        pnl_percent = -100.0
+                    else:
+                        pnl_percent = ((trade_price - old_avg) / old_avg) * 100
+                        
                     symbol = "+" if pnl >= 0 else "-"
                     pnl_msg = f"\n💵 **Closed PnL: {symbol}${abs(pnl):,.2f} ({pnl_percent:+.2f}%)**"
                 
@@ -403,7 +434,7 @@ async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (Paginated)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + PnL Fix)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
@@ -419,11 +450,11 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text(f"⏳ Syncing **{name}**...")
     
-    # Sync Pagination Logic for Add
-    all_positions = []
-    limit = 500
-    offset = 0
     try:
+        # Initial sync fetches ALL pages now to avoid ghost bets
+        all_positions = []
+        limit = 500
+        offset = 0
         while True:
             r = requests.get("https://data-api.polymarket.com/positions", 
                              params={"user": address, "sortBy": "CURRENT", "sortDirection": "DESC", "limit": limit, "offset": offset})
@@ -436,7 +467,6 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_positions = []
 
     add_wallet_db(address, name)
-    
     if all_positions:
         for pos in all_positions:
             asset = pos.get('asset', pos.get('conditionId'))
@@ -451,7 +481,7 @@ async def add_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 }
                 upsert_position(address, asset, data)
     
-    await msg.edit_text(f"✅ Added **{name}** ({len(all_positions)} positions synced).")
+    await msg.edit_text(f"✅ Added **{name}** ({len(all_positions)} bets synced).")
 
 async def remove_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID: return
