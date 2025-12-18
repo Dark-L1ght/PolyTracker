@@ -179,30 +179,6 @@ async def get_event_category(client, event_id):
     except: pass
     return ""
 
-async def check_market_winner(client, condition_id):
-    """Checks who won the market to verify redemption value."""
-    if not condition_id: return None
-    url = f"https://gamma-api.polymarket.com/markets/{condition_id}"
-    try:
-        r = await client.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            # If market is closed, it might have a winner logic
-            # Gamma usually returns tokens. One of them is winner.
-            # Or we look at the 'resolutionSource' or resolved prices
-            # Simplest for now: Check if 'closed' is true, and if we can fetch outcome prices
-            # Actually, let's rely on logic: Did the user hold the winner?
-            
-            # Since Gamma structure varies, let's try to grab 'question' and outcomes
-            # Ideally we check the `tokens` list. The winner usually has price 1.
-            if 'tokens' in data:
-                for token in data['tokens']:
-                    if token.get('winner') is True:
-                        return token.get('outcome') # "Yes" or "No"
-    except:
-        pass
-    return None
-
 # --- PROCESS SINGLE WALLET ---
 async def process_wallet(client, context, address, name):
     known_positions = get_wallet_positions(address)
@@ -371,19 +347,26 @@ async def process_wallet(client, context, address, name):
                             found_exit = True
                             break
                 
-                # Check 2: Did they Redeem? 
+                # Check 2: Did they Redeem? (Fixed Logic using usdcSize)
                 if not found_exit and activity:
                     for a in activity:
                         if a.get("type") == "REDEEM" and a.get("conditionId") == t_condition:
-                            # CRITICAL FIX: Verify Winner
-                            winning_outcome = await check_market_winner(client, t_condition)
+                            usdc_payout = float(a.get("usdcSize", 0))
+                            redeemed_size = float(a.get("size", 0))
                             
-                            if winning_outcome and winning_outcome == t_outcome:
+                            # Calculate real redemption price
+                            if redeemed_size > 0:
+                                trade_price = usdc_payout / redeemed_size
+                            else:
+                                trade_price = 0.0
+                            
+                            # Snap to 1.00 or 0.00 for clean display
+                            if trade_price > 0.9: 
                                 trade_price = 1.00
                                 exit_type = "Redeemed (Won)"
                             else:
                                 trade_price = 0.00
-                                exit_type = "Redeemed (Lost/Burned)"
+                                exit_type = "Redeemed (Lost)"
                             
                             found_exit = True
                             break
@@ -398,7 +381,6 @@ async def process_wallet(client, context, address, name):
                 
                 if old_avg > 0:
                     pnl = (trade_price - old_avg) * size_closed
-                    # Handle full loss (-100%) case
                     if trade_price == 0:
                         pnl_percent = -100.0
                     else:
@@ -434,7 +416,7 @@ async def check_wallets(context: ContextTypes.DEFAULT_TYPE):
 
 # --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **PolyTracker Ready (SQLite + PnL Fix)**")
+    await update.message.reply_text("🤖 **PolyTracker Ready (Redemption Fixed)**")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 **PolyTracker**\n`/add <addr> <name>`\n`/remove <name>`\n`/list`")
